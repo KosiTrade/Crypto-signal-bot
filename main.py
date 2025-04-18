@@ -9,7 +9,6 @@ from telegram import Bot
 
 # Flask-приложение
 app = Flask(name)
-
 @app.route('/')
 def index():
     return "KosiTrade работает"
