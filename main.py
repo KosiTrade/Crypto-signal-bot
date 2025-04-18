@@ -126,3 +126,28 @@ def trading_cycle():
                         
                 except Exception as e:
                     logger.error(f"Ошибка обработки {symbol}: {e}")
+                    continue
+                    
+            time.sleep(300)  # Пауза 5 минут
+            
+        except KeyboardInterrupt:
+            logger.info("Остановка по запросу пользователя")
+            break
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {e}")
+            time.sleep(60)
+
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    try:
+        thread = threading.Thread(target=trading_cycle, daemon=True)
+        thread.start()
+        logger.info("Торговый бот запущен в фоновом режиме")
+    except Exception as e:
+        logger.error(f"Ошибка запуска потока: {e}")
+
+# Запуск приложения
+if name == 'main':
+    run_bot()
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
