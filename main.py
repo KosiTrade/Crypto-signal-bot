@@ -6,7 +6,7 @@ import ta
 from telegram import Bot
 from flask import Flask
 
-# Flask для Render, чтобы не падал процесс
+# Flask для Render (чтобы процесс не падал)
 app = Flask(name)
 
 # Telegram Bot
