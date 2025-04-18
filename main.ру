@@ -1,0 +1,33 @@
+mport os
+import time
+import requests
+from telegram import Bot
+
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+bot = Bot(token=TOKEN)
+
+def get_price():
+    url = "https://api.binance.com/api/v3/ticker/price?symbol=FLOKIUSDT"
+    response = requests.get(url)
+    data = response.json()
+    return float(data["price"])
+
+prev_price = get_price()
+bot.send_message(chat_id=CHAT_ID, text=f"Стартуем! Текущая цена FLOKI: {prev_price}")
+
+while True:
+    try:
+        price = get_price()
+        change = ((price - prev_price) / prev_price) * 100
+
+        if abs(change) >= 2:
+            message = f"FLOKI изменился на {change:.2f}%: {price}"
+            bot.send_message(chat_id=CHAT_ID, text=message)
+            prev_price = price
+
+        time.sleep(60)
+    except Exception as e:
+        bot.send_message(chat_id=CHAT_ID, text=f"Ошибка: {e}")
+        time.sleep(60)
