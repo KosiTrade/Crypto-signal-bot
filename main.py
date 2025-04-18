@@ -78,7 +78,7 @@ def main_logic():
             time.sleep(60)
 
 # Flask Web UI (для Render Web Service)
-app = Flask __name__
+app = Flask (__name__)
 
 @app.route('/')
 def home():
