@@ -21,16 +21,21 @@ def get_klines(symbol):
     ])
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     return df
 
 def analyze(df):
+    if len(df) < 30:
+        return None  # слишком мало данных, чтобы анализировать
+
     close = df["close"]
     volume = df["volume"]
     df["rsi"] = ta.momentum.RSIIndicator(close).rsi()
     df["ema20"] = ta.trend.EMAIndicator(close, window=20).ema_indicator()
     df["macd"] = ta.trend.MACD(close).macd_diff()
-    df["atr"] = ta.volatility.AverageTrueRange(high=df["high"].astype(float),
-                                               low=df["low"].astype(float),
+    df["atr"] = ta.volatility.AverageTrueRange(high=df["high"],
+                                               low=df["low"],
                                                close=close).average_true_range()
 
     latest = df.iloc[-1]
@@ -58,6 +63,8 @@ while True:
         for symbol in SYMBOLS:
             df = get_klines(symbol)
             score = analyze(df)
+            if score is None:
+                continue  # пропустить, если данных мало
             price = df["close"].iloc[-1]
             if score >= 3:
                 send_signal(symbol, score, price)
