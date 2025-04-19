@@ -1,124 +1,86 @@
 import os
-import time
-import threading
 import logging
 import requests
 import pandas as pd
 import ta
-from flask import Flask
-from telegram import Bot, TelegramError
+import time
+from telegram import Bot
+from telegram.error import TelegramError
 
-# --- ЛОГИРОВАНИЕ ---
+# Настройка логов
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - *main* - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- FLASK ---
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "KosiTrade V7 is running", 200
-
-# --- НАСТРОЙКИ ---
-TOKEN = os.getenv("BOT_TOKEN")
+# Настройка Telegram
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+bot = Bot(token=BOT_TOKEN)
 
-if not TOKEN or not CHAT_ID:
-    logger.error("❌ BOT_TOKEN или CHAT_ID не установлены в переменных окружения")
-    raise RuntimeError("Missing BOT_TOKEN or CHAT_ID")
+# Параметры Binance
+BASE_URL = "https://api.binance.com"
+SYMBOLS = ["FLOKIUSDT", "PEPEUSDT", "SHIBUSDT", "DOGEUSDT"]
+INTERVAL = "5m"
+LIMIT = 100
 
-bot = Bot(token=TOKEN)
-
-# --- МОНИТОРИМЫЕ МОНЕТЫ ---
-SYMBOLS = [
-    "FLOKIUSDT", "DOGEUSDT", "PEPEUSDT", "SHIBUSDT",
-    "1000BONKUSDT", "WIFUSDT", "1000SATSUSDT",
-    "1000RATSUSDT", "1000BENJIUSDT"
-]
-
-BLACKLIST = set()  # сюда можно добавлять плохие монеты
-
-# --- ФУНКЦИИ ---
-def fetch_data(symbol):
-    url = f"https://api4.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
+def fetch_klines(symbol):
+    url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval={INTERVAL}&limit={LIMIT}"
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url)
         response.raise_for_status()
         data = response.json()
         df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "number_of_trades",
+            "taker_buy_base", "taker_buy_quote", "ignore"
         ])
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df.dropna()
+        df["close"] = pd.to_numeric(df["close"])
+        df["volume"] = pd.to_numeric(df["volume"])
+        return df
     except Exception as e:
-        logger.error(f"🚨 Ошибка получения данных для {symbol}: {e}")
-        raise
+        logging.error(f"🚨 Error fetching data for {symbol}: {e}")
+        return None
 
 def analyze(df):
-    try:
-        df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-        df['ema20'] = ta.trend.EMAIndicator(df['close'], 20).ema_indicator()
-        df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
-        df['macd'] = ta.trend.MACD(df['close']).macd_diff()
-        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
-        df['momentum'] = ta.momentum.ROCIndicator(df['close']).roc()
+    df["rsi"] = ta.momentum.RSIIndicator(close=df["close"]).rsi()
+    df["ema_20"] = ta.trend.EMAIndicator(close=df["close"], window=20).ema_indicator()
+    df["macd"] = ta.trend.MACD(close=df["close"]).macd_diff()
 
-        latest = df.iloc[-1]
-        score = sum([
-            latest['rsi'] < 35,
-            latest['close'] > latest['ema20'] and latest['ema20'] > latest['ema50'],
-            latest['macd'] > 0 and latest['macd'] > df['macd'].iloc[-2],
-            latest['volume'] > df['volume'].rolling(20).mean().iloc[-1] * 1.5,
-            latest['momentum'] > 0
-        ])
-        return score, round(latest['close'], 6)
-    except Exception as e:
-        logger.error(f"🔧 Ошибка анализа данных: {e}")
-        return 0, 0
+    last = df.iloc[-1]
+    signals = []
 
-def send_signal(symbol, score, price):
+    if last["rsi"] < 30:
+        signals.append("RSI < 30 (перепродан)")
+    if last["close"] > last["ema_20"]:
+        signals.append("Цена выше EMA20")
+    if last["macd"] > 0:
+        signals.append("MACD > 0")
+
+    if len(signals) >= 2:
+        return True, signals
+    return False, signals
+
+def send_signal(symbol, signals):
     try:
-        msg = (
-            f"🚨 *KosiTrade V7 Signal*\n"
-            f"`{symbol}` — Сила сигнала: *{score}/5*\n"
-            f"Цена: ${price}\n"
-            f"[Binance Chart](https://www.binance.com/en/trade/{symbol})"
-        )
-        bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown', disable_web_page_preview=True)
-        logger.info(f"✅ Сигнал отправлен: {symbol}")
+        message = f"📊 Сигнал для {symbol}\n" + "\n".join(f"• {s}" for s in signals)
+        bot.send_message(chat_id=CHAT_ID, text=message)
+        logging.info(f"✅ Сигнал отправлен для {symbol}")
     except TelegramError as e:
-        logger.error(f"📡 Ошибка Telegram: {e}")
+        logging.error(f"❌ Ошибка отправки Telegram: {e}")
 
-def trading_loop():
-    logger.info("🚀 KosiTrade V7 начал работу")
-    bot.send_message(chat_id=CHAT_ID, text="✅ *KosiTrade V7 активирован*", parse_mode='Markdown')
+def main():
     while True:
         for symbol in SYMBOLS:
-            if symbol in BLACKLIST:
-                continue
-            try:
-                df = fetch_data(symbol)
-                score, price = analyze(df)
-                if score >= 4:
-                    send_signal(symbol, score, price)
-                    time.sleep(2)
-            except Exception:
-                continue
-        time.sleep(300)
+            df = fetch_klines(symbol)
+            if df is not None:
+                try:
+                    decision, signals = analyze(df)
+                    if decision:
+                        send_signal(symbol, signals)
+                except Exception as e:
+                    logging.error(f"🔁 Error processing {symbol}: {e}")
+        time.sleep(300)  # 5 минут
 
-def start_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# --- ЗАПУСК ---
-if __name__ == '__main__':
-    threading.Thread(target=trading_loop, daemon=True).start()
-    threading.Thread(target=start_server, daemon=True).start()
-    while True:
-        time.sleep(1)
+if __name__ == "__main__":
+    main()
