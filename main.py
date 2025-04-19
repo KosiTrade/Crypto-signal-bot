@@ -1,182 +1,135 @@
 import os
 import time
-import threading
 import logging
-import requests
+import numpy as np
 import pandas as pd
-import ta
-from flask import Flask
-from telegram import Bot, TelegramError
-
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Инициализация Flask
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "KosiTrade Operational", 200
+import requests
+import ccxt  # Универсальный API для бирж
+import talib as ta
+from sklearn.ensemble import RandomForestClassifier
+from telegram import Bot, Update
+from flask import Flask, request
+from tradingview_ta import TA_Handler
 
 # Конфигурация
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Валидация конфигурации
-if not TOKEN or not CHAT_ID:
-    logger.error("❌ Missing BOT_TOKEN or CHAT_ID in environment variables")
-    raise RuntimeError("Required environment variables are missing")
+app = Flask(__name__)
 
-# Инициализация бота Telegram
-try:
-    bot = Bot(token=TOKEN)
-except TelegramError as e:
-    logger.error(f"❌ Failed to initialize Telegram bot: {e}")
-    raise
+# Инициализация компонентов
+exchange = ccxt.binance({
+    'apiKey': os.getenv('BINANCE_API_KEY'),
+    'secret': os.getenv('BINANCE_SECRET'),
+    'enableRateLimit': True
+})
 
-# Список отслеживаемых символов
-SYMBOLS = [
-    "FLOKIUSDT", "DOGEUSDT", "PEPEUSDT", "SHIBUSDT",
-    "1000BONKUSDT", "WIFUSDT", "1000SATSUSDT",
-    "1000RATSUSDT", "1000BENJIUSDT"
-]
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+model = RandomForestClassifier(n_estimators=100)
 
-def fetch_candle_data(symbol):
-    """Получение и обработка данных свечей с Binance API"""
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
+# 1. Machine Learning Model
+def train_model():
+    data = pd.read_csv('historical_data.csv')
+    features = data[['RSI', 'MACD', 'Volume_Change']]
+    target = data['Target']
+    model.fit(features, target)
+
+# 2. TradingView Integration
+def get_tradingview_signal(symbol):
+    analysis = TA_Handler(
+        symbol=symbol,
+        screener="crypto",
+        exchange="BINANCE",
+        interval="5m"
+    )
+    return analysis.get_analysis().summary
+
+# 3. Risk Management System
+def calculate_position_size(balance, risk_percent):
+    return (balance * risk_percent) / 100
+
+# 4. Advanced Technical Analysis
+def calculate_indicators(df):
+    df['RSI'] = ta.RSI(df['close'])
+    df['MACD'] = ta.MACD(df['close']).macd
+    df['ATR'] = ta.ATR(df['high'], df['low'], df['close'])
+    df['Ichomoku'] = ta.ICHIMOKU(df['high'], df['low'], df['close']).ichimoku_9
+    return df
+
+# 5. Trading Strategy Core
+def generate_signal(df):
+    ml_prediction = model.predict([[df['RSI'].iloc[-1], df['MACD'].iloc[-1], df['Volume'].pct_change().iloc[-1]]])
+    tv_signal = get_tradingview_signal('BTCUSDT')
     
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not isinstance(data, list) or len(data) < 100:
-            raise ValueError(f"Invalid response format for {symbol}")
-            
-        df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ])
-        
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-        
-        return df.dropna()
-        
-    except Exception as e:
-        logger.error(f"🚨 Error fetching data for {symbol}: {e}")
-        raise
-
-def analyze_market(df):
-    """Анализ рыночных данных с использованием технических индикаторов"""
-    try:
-        # Расчет индикаторов
-        df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-        df['ema20'] = ta.trend.EMAIndicator(df['close'], 20).ema_indicator()
-        df['macd'] = ta.trend.MACD(df['close']).macd_diff()
-        df['atr'] = ta.volatility.AverageTrueRange(
-            high=df['high'],
-            low=df['low'],
-            close=df['close']
-        ).average_true_range()
-
-        latest = df.iloc[-1]
-        
-        # Система оценки сигналов
-        score = sum([
-            latest['rsi'] < 35,  # Более гибкий порог
-            latest['close'] > latest['ema20'],
-            latest['macd'] > latest['macd'].shift(1),
-            latest['volume'] > df['volume'].rolling(20).mean().iloc[-1] * 1.5
-        ])
-        
-        return score, round(latest['close'], 6)
-        
-    except Exception as e:
-        logger.error(f"🔧 Analysis error: {e}")
-        return 0, 0.0
-
-def send_telegram_alert(symbol, score, price):
-    """Отправка сигнала в Telegram"""
-    try:
-        message = (
-            f"🚨 **KosiTrade Signal**\n"
-            f"▫️ *Asset*: `{symbol}`\n"
-            f"▫️ *Signal Strength*: {score}/4\n"
-            f"▫️ *Price*: ${price}\n"
-            f"▫️ *Time*: {time.strftime('%H:%M:%S %Z')}"
-        )
-        bot.send_message(
-            chat_id=CHAT_ID,
-            text=message,
-            parse_mode='Markdown'
-        )
-        logger.info(f"✅ Signal sent for {symbol}")
-    except TelegramError as e:
-        logger.error(f"📡 Telegram API Error: {e}")
-
-def trading_engine():
-    """Основной торговый цикл"""
-    logger.info("🚀 Starting trading engine")
+    conditions = {
+        'ml_buy': ml_prediction[0] == 1,
+        'tv_buy': tv_signal['RECOMMENDATION'] == 'STRONG_BUY',
+        'rsi_oversold': df['RSI'].iloc[-1] < 30,
+        'macd_cross': df['MACD'].iloc[-1] > df['MACD'].iloc[-2]
+    }
     
-    try:
-        bot.send_message(
-            chat_id=CHAT_ID,
-            text="✅ *KosiTrade Activated*\n_System is now monitoring markets_",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"⚠️ Failed to send startup message: {e}")
+    if sum(conditions.values()) >= 3:
+        return {
+            'signal': 'BUY',
+            'tp': df['close'].iloc[-1] * 1.03,  # 3% take profit
+            'sl': df['close'].iloc[-1] * 0.98   # 2% stop loss
+        }
+    return {'signal': 'HOLD'}
 
+# 6. Execution Engine
+def execute_trade(signal):
+    if signal['signal'] == 'BUY':
+        balance = exchange.fetch_balance()['free']['USDT']
+        size = calculate_position_size(balance, 2)  # 2% risk
+        order = exchange.create_market_order(
+            symbol='BTC/USDT',
+            side='buy',
+            amount=size,
+            params={
+                'stopLoss': {
+                    'type': 'stopMarket',
+                    'stopPrice': signal['sl']
+                },
+                'takeProfit': {
+                    'type': 'takeProfitMarket',
+                    'stopPrice': signal['tp']
+                }
+            }
+        )
+        return order
+
+# 7. Telegram Notifications
+def send_alert(signal):
+    message = f"""
+    🚀 **AI Trading Signal**
+    - Signal: {signal['signal']}
+    - Entry: {signal.get('price', 'N/A')}
+    - Take Profit: {signal.get('tp', 'N/A')}
+    - Stop Loss: {signal.get('sl', 'N/A')}
+    - Confidence: {signal.get('confidence', 'High')}
+    """
+    bot.send_message(chat_id=os.getenv("CHAT_ID"), text=message, parse_mode='Markdown')
+
+# Main Loop
+def trading_loop():
+    train_model()
     while True:
         try:
-            for symbol in SYMBOLS:
-                try:
-                    df = fetch_candle_data(symbol)
-                    score, price = analyze_market(df)
-                    
-                    if score >= 3:
-                        send_telegram_alert(symbol, score, price)
-                        time.sleep(2)  # Anti-spam delay
-                        
-                except Exception as e:
-                    logger.error(f"🔁 Error processing {symbol}: {e}")
-                    continue
-                    
-            time.sleep(300)  # Интервал проверки
+            data = exchange.fetch_ohlcv('BTC/USDT', '5m', limit=100)
+            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = calculate_indicators(df)
+            signal = generate_signal(df)
+            
+            if signal['signal'] != 'HOLD':
+                execute_trade(signal)
+                send_alert(signal)
                 
-        except KeyboardInterrupt:
-            logger.info("🛑 Manual shutdown requested")
-            break
+            time.sleep(300)
+            
         except Exception as e:
-            logger.error(f"💥 Critical error: {e}")
+            logger.error(f"Critical error: {e}")
             time.sleep(60)
 
-def start_server():
-    """Запуск Flask сервера"""
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
 if __name__ == '__main__':
-    # Запуск в отдельных потоках
-    engine_thread = threading.Thread(target=trading_engine, daemon=True)
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    
-    try:
-        engine_thread.start()
-        server_thread.start()
-        
-        # Поддержка главного потока
-        while True:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        logger.info("👋 Shutting down...")
-    finally:
-        engine_thread.join()
-        server_thread.join()
+    threading.Thread(target=trading_loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=10000)
